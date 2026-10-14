@@ -1,0 +1,28 @@
+name: Factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: App repo, for example owner/name
+        required: true
+      issue:
+        description: Issue number
+        required: true
+
+permissions:
+  contents: read
+
+run-name: "${{ inputs.repo }} #${{ inputs.issue }}"
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show what we received
+        env:
+          FACTORY_REPO: ${{ inputs.repo }}
+          FACTORY_ISSUE: ${{ inputs.issue }}
+        run: |
+          echo "Repo:  $FACTORY_REPO"
+          echo "Issue: $FACTORY_ISSUE"
