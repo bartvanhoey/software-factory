@@ -17,5 +17,8 @@
   "bugs": {
     "url": "https://github.com/bartvanhoey/software-factory/issues"
   },
-  "homepage": "https://github.com/bartvanhoey/software-factory#readme"
+  "homepage": "https://github.com/bartvanhoey/software-factory#readme",
+  "dependencies": {
+    "@upstash/box": "^0.7.9"
+  }
 }
