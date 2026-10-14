@@ -1,0 +1,21 @@
+{
+  "name": "software-factory",
+  "version": "1.0.0",
+  "description": "A small system with one job: you put a **ready label** on a GitHub issue, a **Coding Agent** implements the issue, and a **Pull Request** comes back for you to **Review and Merge**.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bartvanhoey/software-factory.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/bartvanhoey/software-factory/issues"
+  },
+  "homepage": "https://github.com/bartvanhoey/software-factory#readme"
+}
