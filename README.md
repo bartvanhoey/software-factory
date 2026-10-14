@@ -506,7 +506,7 @@ A few things worth knowing:
 
 ### Step 6: Let the agent work on a real issue
 
-In this step we build the last two hand-offs: the **agent** and the **result**. 
+In this step we build the last two hand-offs: the **agent** and the **result**.
 
 A script in the factory repo takes one issue of the demo app from start to pull request, and the factory workflow from Step 3 runs that script instead of only printing the issue number.
 

@@ -15,14 +15,31 @@ permissions:
 
 run-name: "${{ inputs.repo }} #${{ inputs.issue }}"
 
+# One run per issue at a time. A second run waits, finds that ready is gone, and stops.
+concurrency:
+  group: factory-${{ inputs.repo }}-${{ inputs.issue }}
+  cancel-in-progress: false
+
 jobs:
   work:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Show what we received
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install the factory
+        run: npm ci
+
+      - name: Work on the issue
         env:
           FACTORY_REPO: ${{ inputs.repo }}
           FACTORY_ISSUE: ${{ inputs.issue }}
-        run: |
-          echo "Repo:  $FACTORY_REPO"
-          echo "Issue: $FACTORY_ISSUE"
+          FACTORY_GITHUB_TOKEN: ${{ secrets.FACTORY_GITHUB_TOKEN }}
+          UPSTASH_BOX_API_KEY: ${{ secrets.UPSTASH_BOX_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node src/run.mjs
