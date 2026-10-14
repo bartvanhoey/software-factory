@@ -536,7 +536,7 @@ The script has a small settings block at the top. You need four values:
 Get your noreply address with:
 
 ```bash
-    gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"'
+    gh api user --jq "\"\(.id)+\(.login)@users.noreply.github.com\""
 ```
 
 It prints something like `12345678+YOUR-USERNAME@users.noreply.github.com`.
