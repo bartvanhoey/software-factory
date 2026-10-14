@@ -292,11 +292,11 @@ Check that your plan's terms allow automated, unattended use. All workers share 
 
 #### 4.5 Store the secrets in the factory repo
 
-Load the values from `.env` into the repo secrets, so nothing is typed or shown on screen. In Git Bash:
+Load the values from `.env` into the repo secrets, so nothing is typed or shown on screen. Run these commands in **Git Bash**, and not in cmd or PowerShell. Those two do not expand `$FACTORY_GITHUB_TOKEN`, they pass it on as literal text, and the secret then holds the words `$FACTORY_GITHUB_TOKEN` instead of your token. Nothing warns you about it, and later GitHub answers `401 Bad credentials`. Git Bash shows `MINGW64` in its prompt.
 
 ```bash
     cd software-factory
-    set -a; source .env; set +a
+    set -a; source <(tr -d '\r' < .env); set +a
     gh secret set FACTORY_GITHUB_TOKEN --repo YOUR-USERNAME/software-factory --body "$FACTORY_GITHUB_TOKEN"
     gh secret set UPSTASH_BOX_API_KEY --repo YOUR-USERNAME/software-factory --body "$UPSTASH_BOX_API_KEY"
     gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo YOUR-USERNAME/software-factory --body "$CLAUDE_CODE_OAUTH_TOKEN"
@@ -320,6 +320,7 @@ The demo app should only have `FACTORY_TRIGGER_TOKEN`. You can check that with t
 
 A few things worth knowing:
 
+- `tr -d '\r'` removes the invisible carriage return that Windows editors such as VS Code add to the end of each line of `.env`. Without it, every secret is stored with a `\r` at the end, and GitHub later rejects the token with `401 Bad credentials`. Node's `--env-file` ignores the `\r`, so the scripts on your own machine keep working and hide the problem.
 - Never paste a token into a chat, an issue or a commit. If one leaks, delete or regenerate it right away.
 - Fine-grained tokens expire (you choose the date when you create them), and the Claude token lasts a year. Write down the dates, and put a reminder in your calendar.
 - When you finish the project, rotate or delete all four secrets.
@@ -806,12 +807,13 @@ Open the pull request and read it like any other. It should say `Closes #1`, sho
 
 If it fails, the issue now carries `factory:needs-attention` and a comment with the log. Read that first. Then:
 
-1. `GitHub ... failed: 403` or `404`: the factory token (Step 4.2) cannot reach the demo app, is missing one of Contents, Pull requests or Issues, or has expired.
-2. `GitHub ... failed: 422` when opening the pull request: usually a branch problem. Delete the `factory/issue-N` branch in the demo app and run again.
-3. The setup command failed: look at the log on the issue. `npm ci` needs a `package-lock.json` in the demo app. Run `npm install` there once and commit the lock file.
-4. The agent stopped with an error: usually the Claude token. Check Step 4.4.
-5. The checks failed: the agent's change does not build. Read the log, improve the issue text, and add the label again.
-6. The preview on the pull request is blocked: the commit author is wrong. Use the noreply address from 6.1.
+1. `GitHub ... failed: 401` with `Bad credentials`: GitHub does not accept the token. It works on your machine but fails in the workflow? Then the stored secret is broken. There are two usual causes: the commands in Step 4.5 were run in cmd or PowerShell, which store the literal text `$FACTORY_GITHUB_TOKEN` instead of the token, or the secret was saved with a hidden `\r` from a Windows `.env` file. Open **Git Bash**, save the three secrets again with the commands in Step 4.5 (the `tr -d '\r'` version), and re-run the workflow. If it fails on your machine too, the token is wrong or has expired: create it again (Step 4.2).
+2. `GitHub ... failed: 403` or `404`: the factory token (Step 4.2) cannot reach the demo app, is missing one of Contents, Pull requests or Issues, or has expired.
+3. `GitHub ... failed: 422` when opening the pull request: usually a branch problem. Delete the `factory/issue-N` branch in the demo app and run again.
+4. The setup command failed: look at the log on the issue. `npm ci` needs a `package-lock.json` in the demo app. Run `npm install` there once and commit the lock file.
+5. The agent stopped with an error: usually the Claude token. Check Step 4.4.
+6. The checks failed: the agent's change does not build. Read the log, improve the issue text, and add the label again.
+7. The preview on the pull request is blocked: the commit author is wrong. Use the noreply address from 6.1.
 
 A run that was killed in the middle leaves a Box called `factory-issue-N-...` behind. Delete it in the Upstash console. Boxes count against your plan.
 
