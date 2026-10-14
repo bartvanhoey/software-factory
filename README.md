@@ -905,3 +905,300 @@ A few things worth knowing:
 - When the checks fail, the agent gets no second chance yet. Giving it the failure output and one more attempt is a good extension once this works.
 - Parallel runs for different issues of the same app all edit the same few files, so later merges may conflict. That is a property of parallel work, not a bug.
 - When you finish the project, rotate or delete the four secrets from Step 4.
+
+### Step 7: A pool of reusable workers
+
+In Step 6 every run created a new Box and deleted it again. That works for one issue at a time, but it has two weak spots: every run pays for creating a Box, and nothing limits how many Boxes are alive when several issues are labelled at once. In this step we replace that with a **pool of workers**: a fixed number of named Boxes that sleep (are **paused**) when idle. A run **claims** a free worker, uses it, cleans it, and gives it back.
+
+- **Workers.** `factory-worker-1`, `factory-worker-2`, and so on. Each one is a Box that is created once, ahead of time, and paused.
+- **A shared state without a database.** Box **labels** are the state. A worker with the label `busy` is taken. The label API is reachable from every workflow run, so every run sees the same truth.
+- **A claim.** A run picks a free worker, adds `busy` and its own label `run-<id>` to it, waits four seconds, and looks at the labels again. If another run label sorts lower than its own, that run won the worker, and we back off and try another one. If every worker is busy, the run waits and looks again every 30 seconds.
+- **A release.** At the end the run removes the labels, deletes its sign-in file and its clone, and pauses the Box.
+
+The workflow, the trigger and the GitHub part of `src/run.mjs` stay as they are. We add one file with the pool logic, one script to manage the workers, and change two blocks in `src/run.mjs`.
+
+#### 7.1 Decide how many workers
+
+Each worker is one Box, and paused Boxes count against your Upstash plan. Check the limit of your plan in the Upstash console first. On the free plan, the pricing page lists 10 concurrent running Boxes and does not state a total, and the first version of this factory ran into a "Box limit reached" error at 10 Boxes in total, paused ones included. Leave one slot for the smoke test.
+
+All workers also share the rate limits of your one Claude subscription, so more workers means a faster pile-up of limits, not faster work. Start with **2**.
+
+Browser access is decided when a Box is created and cannot be added later. The workers below are created with it switched on, like the Box in Step 5. If you never want it, change `browser: true` to `false` in the next file **before** you create the workers.
+
+#### 7.2 Write the pool
+
+Create the file `src/pool.mjs` in the **software-factory** repo and paste in the following:
+
+```js
+// The pool of worker Boxes. Box labels are the shared state, because every run can read and write them through the Upstash API.
+import { Box } from "@upstash/box"
+
+// Settings: how many workers, and how long a run waits for a free one.
+export const WORKER_COUNT = 2
+export const NAME_PREFIX = "factory-worker-"
+const WAIT_FOR_WORKER_MINUTES = 30
+
+// The labels. A Box holds at most 5 labels of at most 20 characters each.
+export const POOL_LABEL = "factory"
+export const BUSY_LABEL = "busy"
+const REQUEST_TIMEOUT_MS = 15 * 60 * 1000
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// The names of the workers that should exist, and the Boxes that do exist. The prefix filter skips the Boxes of Steps 5 and 6.
+export const workerNames = () => Array.from({ length: WORKER_COUNT }, (_, i) => `${NAME_PREFIX}${i + 1}`)
+export const listWorkers = async () => (await Box.list({ label: POOL_LABEL })).filter((box) => box.name?.startsWith(NAME_PREFIX))
+
+// Create one worker Box. The workers script pauses it right after.
+export const createWorkerBox = (name) => Box.create({ name, labels: [POOL_LABEL], runtime: "node", browser: true, timeout: REQUEST_TIMEOUT_MS })
+
+// Wait for a free worker and mark it as busy. Returns null when none became free in time.
+export async function claimWorker(runId) {
+  const runLabel = `run-${runId}`.slice(0, 20)
+  const deadline = Date.now() + WAIT_FOR_WORKER_MINUTES * 60_000
+
+  for (let attempt = 0; Date.now() < deadline; attempt++) {
+    // Free means: not busy, and not broken or still being created.
+    const free = (await listWorkers()).filter((w) => !["creating", "error", "deleted"].includes(w.status) && !w.labels?.includes(BUSY_LABEL))
+    if (free.length === 0) {
+      console.log("No free worker. Checking again in 30 seconds.")
+      await sleep(30_000)
+      continue
+    }
+
+    // Runs that start together would all pick the same worker, so the pick starts at an offset taken from the run id.
+    const offset = Number(String(runId).replace(/\D/g, "").slice(-6)) + attempt
+    const data = free[offset % free.length]
+    const box = await Box.get(data.id, { timeout: REQUEST_TIMEOUT_MS })
+
+    // Mark the worker as busy, and as ours. Failing to add a label also means that another run got there first.
+    try {
+      if ((await box.labels.list()).includes(BUSY_LABEL)) continue
+      await box.labels.add(runLabel)
+      await box.labels.add(BUSY_LABEL)
+    } catch (error) {
+      console.log(`Could not claim ${data.name} (${error.message}). Trying another.`)
+      await box.labels.remove(runLabel).catch(() => {})
+      await sleep(2_000 + Math.random() * 3_000)
+      continue
+    }
+
+    // Give a rival run a moment to add its label, then look again. The lowest run label wins.
+    await sleep(4_000)
+    const rivals = (await box.labels.list()).filter((label) => label.startsWith("run-") && label !== runLabel)
+    if (rivals.some((label) => label < runLabel)) {
+      console.log(`${data.name} was claimed by another run at the same moment. Trying another.`)
+      await box.labels.remove(runLabel)
+      continue
+    }
+
+    // A paused worker has to be woken up before we run commands in it.
+    if (data.status === "paused") await box.resume()
+    return { box, name: data.name, runLabel }
+  }
+  return null
+}
+
+// Give the worker back: remove our labels, and let it sleep.
+export async function releaseWorker({ box, name, runLabel }) {
+  try {
+    await box.labels.remove(runLabel)
+    await box.labels.remove(BUSY_LABEL)
+    await box.pause()
+    console.log(`Released worker ${name} and paused its Box.`)
+  } catch (error) {
+    console.error(`Could not fully release worker ${name}: ${error.message}`)
+  }
+}
+```
+
+There is no lock anywhere, and none is needed in practice. Two things keep it safe enough: the workflow's `concurrency` group allows one run per issue, and the four-second wait lets a rival's label appear before anyone starts working. The claim protocol is simple, not perfect. The rare case where it fails is two runs that start within the same fraction of a second and are both unlucky, and the way out is in 7.6.
+
+#### 7.3 Write the workers script
+
+Create the file `scripts/workers.mjs` in the **software-factory** repo. One script, four commands: create the pool, look at it, free a stuck worker, delete the pool.
+
+```js
+// Manage the pool of worker Boxes.
+// node --env-file=.env scripts/workers.mjs status
+// node --env-file=.env scripts/workers.mjs provision [--yes]
+// node --env-file=.env scripts/workers.mjs release <worker name>
+// node --env-file=.env scripts/workers.mjs delete [--yes]
+import { Box } from "@upstash/box"
+import { BUSY_LABEL, listWorkers, workerNames, createWorkerBox } from "../src/pool.mjs"
+
+const [command, argument] = process.argv.slice(2).filter((arg) => !arg.startsWith("--"))
+const yes = process.argv.includes("--yes")
+
+async function main() {
+  const workers = await listWorkers()
+
+  // Who exists, who is busy, and for which run.
+  if (command === "status") {
+    if (workers.length === 0) console.log("No workers yet. Run the provision command.")
+    for (const w of workers) {
+      const run = (w.labels ?? []).find((label) => label.startsWith("run-"))
+      console.log(`${w.name.padEnd(20)} ${w.status.padEnd(8)} ${w.labels?.includes(BUSY_LABEL) ? `BUSY (${run ?? "no run label"})` : "free"}`)
+    }
+
+  // Create the workers that are missing, and pause each one right away.
+  } else if (command === "provision") {
+    const missing = workerNames().filter((name) => !workers.some((w) => w.name === name))
+    console.log(missing.length ? `Boxes to create: ${missing.join(", ")}` : "All workers exist already.")
+    if (missing.length && !yes) console.log("\nPreview only. Add --yes to create them. Each one uses one Box slot.")
+    if (missing.length && yes) {
+      for (const name of missing) {
+        const box = await createWorkerBox(name)
+        await box.pause()
+        console.log(`Created ${name} (${box.id}) and paused it.`)
+      }
+    }
+
+  // Free a worker that a cancelled run left busy: remove its sign-in file and its labels, then pause it.
+  } else if (command === "release") {
+    const data = workers.find((w) => w.name === argument)
+    if (!data) throw new Error(`No worker called "${argument}". Run the status command to see the names.`)
+    const box = await Box.get(data.id)
+    if (data.status === "paused") await box.resume()
+    await box.exec.command("rm -rf /workspace/home/.factory ~/.git-credentials")
+    for (const label of data.labels ?? []) if (label === BUSY_LABEL || label.startsWith("run-")) await box.labels.remove(label)
+    await box.pause()
+    console.log(`Released ${data.name}.`)
+
+  // Delete all workers. This cannot be undone.
+  } else if (command === "delete") {
+    console.log(workers.length ? `Boxes to delete: ${workers.map((w) => w.name).join(", ")}` : "No workers to delete.")
+    if (workers.length && !yes) console.log("\nPreview only. Add --yes to delete them for good.")
+    if (workers.length && yes) {
+      await Box.delete({ boxIds: workers.map((w) => w.id) })
+      console.log("Deleted.")
+    }
+
+  } else {
+    console.log("Usage: workers.mjs <status | provision | release <worker name> | delete> [--yes]")
+  }
+}
+
+// Do not call process.exit() after fetch: on Windows it can crash Node. Set the exit code instead.
+try {
+  await main()
+} catch (error) {
+  console.error(error.message)
+  process.exitCode = 1
+}
+```
+
+#### 7.4 Create the workers
+
+Look first, then create. In Git Bash in the **software-factory** repo:
+
+```bash
+    node --env-file=.env scripts/workers.mjs status
+    node --env-file=.env scripts/workers.mjs provision
+    node --env-file=.env scripts/workers.mjs provision --yes
+    node --env-file=.env scripts/workers.mjs status
+```
+
+The first `status` prints that there are no workers. The `provision` preview names the two Boxes. After `--yes`, the last `status` should show:
+
+```text
+factory-worker-1     paused   free
+factory-worker-2     paused   free
+```
+
+Check your Upstash console as well: two Boxes, paused. They cost nothing while paused except their disk.
+
+#### 7.5 Change the run script to use the pool
+
+Two blocks in `src/run.mjs` change. Nothing else in the file does.
+
+**First**, replace the import at the top:
+
+```js
+import { Box } from "@upstash/box"
+```
+
+with:
+
+```js
+import { claimWorker, releaseWorker } from "./pool.mjs"
+```
+
+**Second**, find the block that starts at `// Show on the issue that work has started.` and ends at the line `console.log(`Created Box ${box.id}`)`. Replace that whole block, including the `branch`, `repoDir`, `authedUrl` and `noStore` lines in it, with:
+
+```js
+  // Claim a free worker first, so that the issue only says "running" when work really starts. This waits when all workers are busy.
+  const runId = process.env.GITHUB_RUN_ID ?? `local${Date.now().toString().slice(-9)}`
+  const claim = await claimWorker(runId)
+  if (!claim) {
+    await comment(`The factory had no free worker in time. Remove and add the \`${LABELS.ready}\` label again to try later.`)
+    throw new Error("No free worker in time")
+  }
+  const { box, name } = claim
+  console.log(`Worker ${name} claimed. Box: ${box.id}`)
+
+  // Show on the issue that work has started, and by whom.
+  await removeLabel(LABELS.ready)
+  await removeLabel(LABELS.attention)
+  await addLabels([LABELS.running])
+  await comment(`Worker \`${name}\` picked this up.`)
+
+  const branch = `factory/issue-${issue.number}`
+  const repoDir = `${HOME}/work/${repo.split("/")[1]}`
+  const authedUrl = `https://x-access-token:${githubToken}@github.com/${repo}.git`
+  const noStore = "-c credential.helper=" // the Box image tells git to save credentials on disk
+```
+
+**Third**, in the `finally` block at the bottom of `main`, replace these lines:
+
+```js
+    // Remove the sign-in file, then the Box.
+    await sh(box, `rm -rf ${HOME}/.factory ~/.git-credentials`, { allowFailure: true }).catch(() => {})
+    await box.delete()
+    console.log(`\nDeleted Box ${box.id}.`)
+```
+
+with:
+
+```js
+    // A paused Box keeps its disk. Remove the sign-in file, the clone and Claude's transcripts, then give the worker back.
+    await sh(box, `rm -rf ${HOME}/.factory ~/.git-credentials ${q(repoDir)} ${JOB} ${HOME}/.claude/projects`, { allowFailure: true }).catch(() => {})
+    await releaseWorker(claim)
+```
+
+The code at the start of the job that clones the repo already begins with `rm -rf` of an old clone, so a worker that was not cleaned properly still starts fresh.
+
+Commit it with the workflow files from Step 6:
+
+```bash
+    git add src scripts
+    git commit -m "Use a pool of workers"
+    git push
+```
+
+#### 7.6 Test it
+
+**One issue.** Create a small issue in the demo app, add the `ready` label, and watch two things at once: the issue in the browser, and in a second Git Bash window:
+
+```bash
+    node --env-file=.env scripts/workers.mjs status
+```
+
+While the run is going, one worker shows `BUSY (run-...)` and the Box in the Upstash console is running. When the pull request is open, the same worker is `paused` and `free` again. The first comment on the issue now names the worker.
+
+**Three issues at once.** With two workers, this shows the waiting. Create three small issues and add `ready` to all of them in quick succession. Open the three **Factory** runs in the Actions tab. Two start working on different workers. The third prints `No free worker. Checking again in 30 seconds.` until one of the first two finishes, then takes the freed worker. At the end of the test all three issues are on `factory:review`, and `status` shows both workers free and paused.
+
+If something goes wrong:
+
+1. A run times out with "No free worker in time": all workers were busy for 30 minutes. Check `status`. If one shows `BUSY` but no run is going, a cancelled run left it behind, see the next point.
+2. A worker is `BUSY` and no run is active: a cancelled or crashed run never reaches the `finally` block. Free it with `node --env-file=.env scripts/workers.mjs release factory-worker-1`. This also removes its sign-in file.
+3. Two issues end up in the same worker: the claim race from 7.2. Look at the two run logs for "claimed by another run at the same moment". If you see it often, raise the four-second wait in `claimWorker`.
+4. `Box.list` or `Box.get` returns an authorization error: `UPSTASH_BOX_API_KEY` is missing or wrong, locally in `.env` or as a secret.
+5. The Box limit error when provisioning: your plan is full. Delete old Boxes in the console, for example leftovers from Steps 5 and 6 that are called `factory-smoke-claude` or `factory-issue-N-...`, or choose a smaller `WORKER_COUNT`.
+
+A few things worth knowing:
+
+- A paused Box keeps its disk. That is why the `finally` block deletes the Claude token and the GitHub clone, and why `release` does the same for a worker that a crashed run left behind. Never skip that.
+- A run holds a GitHub Actions runner the whole time, including the time it waits for a free worker, up to 30 minutes. In a private repo those minutes count against your plan.
+- Several pull requests in the same small app edit the same few files. Each one is fine alone, and later merges may conflict. That is a property of parallel work, not a bug.
+- The workers are created once and keep running forever. When you finish the project, delete them with `node --env-file=.env scripts/workers.mjs delete --yes`, and rotate or delete the four secrets from Step 4.
+- Every worker starts a job with an empty workspace but with the tools of the stock Box. If your app needs more tools than a stock Box has, those go into a worker image, which is a separate step.
