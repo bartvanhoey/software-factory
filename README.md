@@ -503,3 +503,403 @@ A few things worth knowing:
 - The Box runs commands with plain `sh`, and a command holds one HTTP request open until it ends. That is fine for this one-line question. A real agent run takes many minutes, so later we start it in the background and poll for the result.
 - The token only lives in the Box for the length of the test, and the script deletes it at the end. Never print it in your own debugging output.
 - In the next step we let the agent work on a real issue.
+
+### Step 6: Let the agent work on a real issue
+
+In this step we build the last two hand-offs: the **agent** and the **result**. 
+
+A script in the factory repo takes one issue of the demo app from start to pull request, and the factory workflow from Step 3 runs that script instead of only printing the issue number.
+
+For one issue, the script does this, in order:
+
+1. Reads the issue and stops unless it is open and carries the `ready` label.
+2. Swaps the label `ready` for `factory:running` and comments that work has started.
+3. Creates a Box, clones the demo app into it on a new branch `factory/issue-N`, and runs the install command.
+4. Signs Claude Code in and gives it the issue text in headless mode. Claude edits the files.
+5. Runs the app's checks (here: the build). If they fail, nobody gets a pull request, the issue gets `factory:needs-attention` and a comment with the log.
+6. Commits, pushes the branch, opens a pull request that says `Closes #N`, and swaps `factory:running` for `factory:review`.
+7. Always, at the end: removes the sign-in file and deletes the Box.
+
+One rule decides the shape of the script: **the agent never gets the GitHub token.** The agent only edits files. The script does all the git work. That way an issue text that tries to talk the agent into pushing somewhere else has nothing to push with.
+
+#### 6.1 Collect your settings
+
+The script has a small settings block at the top. You need four values:
+
+| Setting | Value for the demo app |
+|---------|------------------------|
+| `APP_REPO` | `YOUR-USERNAME/software-factory-demo-app` |
+| `SETUP` | `npm ci`. Installs the dependencies in the Box. |
+| `CHECKS` | `npm run build`. Must pass before a pull request is opened. |
+| `GIT_AUTHOR` | Your name, and your GitHub **noreply** email address. |
+
+Get your noreply address with:
+
+```bash
+    gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"'
+```
+
+It prints something like `12345678+YOUR-USERNAME@users.noreply.github.com`.
+
+Do not invent an email address for `GIT_AUTHOR`. The demo app deploys previews on Vercel, and Vercel blocks the preview of a commit whose author is not a member of your team. An invented address belongs to some unrelated GitHub user, and your preview will be blocked.
+
+#### 6.2 Write the script
+
+Create the file `src/run.mjs` in the **software-factory** repo and paste in the following. Replace the three `YOUR-...` values in the settings block.
+
+```js
+// Takes one ready issue from start to pull request.
+// Run locally: node --env-file=.env src/run.mjs YOUR-USERNAME/software-factory-demo-app 1
+import { Box } from "@upstash/box"
+
+// Settings: change these to fit your own app.
+const APP_REPO = "YOUR-USERNAME/software-factory-demo-app"
+const ALLOWED_ACTORS = ["YOUR-USERNAME"]
+const BASE_BRANCH = "main"
+const SETUP = ["npm ci"]
+const CHECKS = ["npm run build"]
+const GIT_AUTHOR = { name: "YOUR NAME", email: "12345678+YOUR-USERNAME@users.noreply.github.com" }
+const SETUP_TIMEOUT_MINUTES = 20
+const AGENT_TIMEOUT_MINUTES = 25
+
+// The labels from Step 3.2, and the places inside the Box that we use.
+const LABELS = { ready: "ready", running: "factory:running", review: "factory:review", attention: "factory:needs-attention" }
+const HOME = "/workspace/home"
+const JOB = `${HOME}/job`
+const ENV_FILE = `${HOME}/.factory/env`
+const NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION:"
+
+// Input: the repo and issue number, from the command line or from the workflow.
+const [repo = process.env.FACTORY_REPO, issueNumber = process.env.FACTORY_ISSUE] = process.argv.slice(2)
+const githubToken = process.env.FACTORY_GITHUB_TOKEN
+const claudeToken = process.env.CLAUDE_CODE_OAUTH_TOKEN
+
+// Quote a value for the shell, hide secrets in anything we print, and wait.
+const q = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`
+const hide = (text) => String(text).replaceAll(githubToken ?? "<none>", "***").replaceAll(claudeToken ?? "<none>", "***")
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// A small GitHub REST helper, using the factory token from Step 4.2.
+async function github(path, { method = "GET", body } = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${githubToken}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!response.ok) throw new Error(`GitHub ${method} ${path} failed: ${response.status} ${await response.text()}`)
+  return response.status === 204 ? null : response.json()
+}
+const addLabels = (labels) => github(`/repos/${repo}/issues/${issueNumber}/labels`, { method: "POST", body: { labels } })
+const comment = (body) => github(`/repos/${repo}/issues/${issueNumber}/comments`, { method: "POST", body: { body } })
+const removeLabel = (label) =>
+  github(`/repos/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`, { method: "DELETE" }).catch((error) => {
+    if (!String(error.message).includes(" 404 ")) throw error // the label was not on the issue
+  })
+
+// Run a short shell command in the Box, and throw on a non-zero exit code (the helper from Step 5).
+async function sh(box, command, { allowFailure = false } = {}) {
+  const run = await box.exec.command(`( ${command} ) 2>&1; echo "__EXIT__$?"`)
+  const match = /__EXIT__(\d+)\s*$/.exec(run.result ?? "")
+  const code = match ? Number(match[1]) : 1
+  const output = (run.result ?? "").replace(/__EXIT__\d+\s*$/, "").trimEnd()
+  if (code !== 0 && !allowFailure) throw new Error(`Command failed with exit code ${code}:\n${output.slice(-2000)}`)
+  return { code, output }
+}
+
+// Run a longer bash script in the Box in the background, and poll until it ends.
+async function runScript(box, name, lines, timeoutMinutes) {
+  const base = `${JOB}/${name}`
+  await sh(box, `mkdir -p ${JOB} && rm -f ${base}.exit ${base}.log`)
+  await box.files.write({ path: `${base}.sh`, content: ["#!/bin/bash", `exec > ${base}.log 2>&1`, "set -e", ...lines, ""].join("\n") })
+  await sh(box, `nohup setsid bash -lc ${q(`bash ${base}.sh; echo $? > ${base}.exit`)} > /dev/null 2>&1 & echo started`)
+
+  const started = Date.now()
+  while (Date.now() - started < timeoutMinutes * 60_000) {
+    await sleep(10_000)
+    const { output } = await sh(box, `cat ${base}.exit 2>/dev/null || echo running`)
+    if (output.trim() !== "running") {
+      const log = (await sh(box, `tail -n 80 ${base}.log`, { allowFailure: true })).output
+      return { passed: output.trim() === "0", log }
+    }
+    console.log(`  ${name} is still running...`)
+  }
+  throw new Error(`"${name}" did not finish within ${timeoutMinutes} minutes.`)
+}
+
+// The task for the agent: the issue, plus the rules of the factory.
+const buildPrompt = (issue) => `You are a coding agent. The repository ${repo} is checked out in the current folder, on a new branch.
+
+Implement this GitHub issue.
+
+# Issue #${issue.number}: ${issue.title}
+
+${issue.body?.trim() || "(The issue has no description.)"}
+
+# Rules
+
+- Make the smallest change that fully solves the issue. Follow the style of the existing code.
+- Do not run git commit, git push or change git settings. The factory does that after you.
+- Do not touch anything in .github/.
+- Before you stop, run these commands yourself. They must pass: ${CHECKS.join(" ; ")}
+- When you are done, reply with a short summary of what you changed. It becomes the pull request description.
+- If the issue is too unclear to implement, change nothing and start your reply with "${NEEDS_CLARIFICATION}" followed by your question.
+`
+
+async function main() {
+  // Refuse anything that is not meant for this factory.
+  if (!repo || !issueNumber) throw new Error("Usage: node src/run.mjs <owner/repo> <issue number>")
+  if (repo !== APP_REPO) throw new Error(`${repo} is not ${APP_REPO}, so this run is refused.`)
+  if (!githubToken || !claudeToken) throw new Error("FACTORY_GITHUB_TOKEN and CLAUDE_CODE_OAUTH_TOKEN must both be set.")
+  // The "Run workflow" button is a second way in, open to everyone with write access to this repo.
+  if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch" && !ALLOWED_ACTORS.includes(process.env.GITHUB_ACTOR)) {
+    throw new Error(`${process.env.GITHUB_ACTOR} is not in ALLOWED_ACTORS, so this run is refused.`)
+  }
+
+  // Only work on an open issue that still has the ready label. This also makes a duplicate run harmless.
+  const issue = await github(`/repos/${repo}/issues/${issueNumber}`)
+  console.log(`Issue ${repo}#${issue.number}: ${issue.title}`)
+  if (issue.state !== "open" || !issue.labels.some((label) => label.name === LABELS.ready)) {
+    console.log(`Not open with the "${LABELS.ready}" label. Skipping.`)
+    return
+  }
+
+  // Report a problem on the issue and hand it back to a human.
+  const needsAttention = async (message) => {
+    await removeLabel(LABELS.ready)
+    await removeLabel(LABELS.running)
+    await addLabels([LABELS.attention])
+    await comment(message)
+    console.log(`Issue labelled ${LABELS.attention}.`)
+  }
+
+  // Show on the issue that work has started.
+  await removeLabel(LABELS.ready)
+  await removeLabel(LABELS.attention)
+  await addLabels([LABELS.running])
+  await comment("The factory picked this up.")
+
+  // Create the Box. Its name has a time part so that a leftover Box never blocks a new run.
+  const branch = `factory/issue-${issue.number}`
+  const repoDir = `${HOME}/work/${repo.split("/")[1]}`
+  const authedUrl = `https://x-access-token:${githubToken}@github.com/${repo}.git`
+  const noStore = "-c credential.helper=" // the Box image tells git to save credentials on disk
+  const box = await Box.create({ name: `factory-issue-${issue.number}-${Date.now().toString().slice(-6)}`, labels: ["factory", "job"], runtime: "node", timeout: 15 * 60 * 1000 })
+  console.log(`Created Box ${box.id}`)
+
+  try {
+    // Clone with the token, then remove the token from the clone. It is only used again for the push.
+    console.log("\nPreparing the workspace...")
+    await sh(box, `rm -rf ${q(repoDir)} ${JOB} ~/.git-credentials && mkdir -p ${JOB}`)
+    await sh(box, `git ${noStore} clone --quiet --depth 50 --branch ${q(BASE_BRANCH)} ${q(authedUrl)} ${q(repoDir)}`)
+    await sh(box, `cd ${q(repoDir)} && git remote set-url origin https://github.com/${repo}.git && git checkout --quiet -b ${q(branch)} && git config user.name ${q(GIT_AUTHOR.name)} && git config user.email ${q(GIT_AUTHOR.email)}`)
+
+    // Install the dependencies of the app.
+    const setup = await runScript(box, "setup", [`cd ${q(repoDir)}`, ...SETUP], SETUP_TIMEOUT_MINUTES)
+    if (!setup.passed) {
+      await needsAttention(`The setup command failed in the Box, so the agent was not started. This is a factory problem, not a problem with the issue.\n\nLog:\n\n    ${hide(setup.log).slice(-3000).replaceAll("\n", "\n    ")}`)
+      return
+    }
+
+    // Sign Claude Code in: the token goes in a file that only this user can read.
+    console.log("\nSigning in and starting the agent...")
+    await sh(box, `mkdir -p ${HOME}/.factory && chmod 700 ${HOME}/.factory`)
+    await box.files.write({ path: ENV_FILE, content: `export CLAUDE_CODE_OAUTH_TOKEN='${claudeToken}'\n` })
+    await sh(box, `chmod 600 ${ENV_FILE}`)
+
+    // Run the agent. Its final reply is written to summary.md, and becomes the pull request description.
+    await box.files.write({ path: `${JOB}/prompt.md`, content: buildPrompt(issue) })
+    const agent = await runScript(
+      box,
+      "agent",
+      [`. ${ENV_FILE}`, "export PATH=$HOME/.local/bin:$PATH", `cd ${q(repoDir)}`, `claude -p "$(cat ${JOB}/prompt.md)" --dangerously-skip-permissions --output-format text > ${JOB}/summary.md`],
+      AGENT_TIMEOUT_MINUTES,
+    )
+    const summary = (await sh(box, `cat ${JOB}/summary.md 2>/dev/null`, { allowFailure: true })).output.trim()
+    if (!agent.passed) {
+      await needsAttention(`The agent stopped with an error.\n\nLog:\n\n    ${hide(agent.log).slice(-3000).replaceAll("\n", "\n    ")}`)
+      return
+    }
+
+    // The agent may hand the issue back with a question instead of a change.
+    if (summary.startsWith(NEEDS_CLARIFICATION)) {
+      await needsAttention(`The agent needs more detail before it can start:\n\n> ${summary.slice(NEEDS_CLARIFICATION.length).trim()}\n\nEdit the issue, then add the \`${LABELS.ready}\` label again.`)
+      return
+    }
+
+    // Run the checks ourselves. We do not take the agent's word for it.
+    console.log("\nRunning checks...")
+    const checks = await runScript(box, "checks", [`cd ${q(repoDir)}`, ...CHECKS], SETUP_TIMEOUT_MINUTES)
+    if (!checks.passed) {
+      await needsAttention(`The change did not pass the checks, so no pull request was opened.\n\nLog:\n\n    ${hide(checks.log).slice(-3000).replaceAll("\n", "\n    ")}`)
+      return
+    }
+
+    // Did the agent change anything at all?
+    const status = (await sh(box, `cd ${q(repoDir)} && git add -A && git status --porcelain`)).output.trim()
+    if (!status) {
+      await needsAttention(`The agent finished without changing any files.\n\nIts reply:\n\n> ${summary || "(empty)"}`)
+      return
+    }
+    console.log(`\nChanged files:\n${status}`)
+
+    // Commit and push. Only now does the token come back, and the agent is long finished.
+    await sh(box, `cd ${q(repoDir)} && git commit --quiet -m ${q(`${issue.title}\n\nCloses #${issue.number}`)}`)
+    await sh(box, `cd ${q(repoDir)} && git ${noStore} push --quiet --force ${q(authedUrl)} ${q(`${branch}:${branch}`)}`)
+
+    // Open the pull request, or update the open one when this issue is run again.
+    const prBody = `Closes #${issue.number}\n\n${summary || "(The agent gave no summary.)"}\n\n---\nBuilt by the factory in an Upstash Box. Checks passed: ${CHECKS.map((c) => `\`${c}\``).join(", ")}.`
+    const open = await github(`/repos/${repo}/pulls?state=open&head=${repo.split("/")[0]}:${encodeURIComponent(branch)}`)
+    const pr = open.length
+      ? await github(`/repos/${repo}/pulls/${open[0].number}`, { method: "PATCH", body: { title: issue.title, body: prBody } })
+      : await github(`/repos/${repo}/pulls`, { method: "POST", body: { head: branch, base: BASE_BRANCH, title: issue.title, body: prBody } })
+    console.log(`\nPull request: ${pr.html_url}`)
+
+    // Show on the issue that a pull request is waiting.
+    await removeLabel(LABELS.running)
+    await addLabels([LABELS.review])
+    await comment(`Pull request ready for review: ${pr.html_url}`)
+  } catch (error) {
+    await needsAttention(`The factory hit an error:\n\n    ${hide(error.message).slice(0, 1500).replaceAll("\n", "\n    ")}`).catch(() => {})
+    throw error
+  } finally {
+    // Remove the sign-in file, then the Box.
+    await sh(box, `rm -rf ${HOME}/.factory ~/.git-credentials`, { allowFailure: true }).catch(() => {})
+    await box.delete()
+    console.log(`\nDeleted Box ${box.id}.`)
+  }
+}
+
+// Do not call process.exit() after fetch: on Windows it can crash Node. Set the exit code instead.
+try {
+  await main()
+} catch (error) {
+  console.error(`\nFactory run failed: ${hide(error.message)}`)
+  process.exitCode = 1
+}
+```
+
+What the script does that is worth understanding:
+
+- **The token stays away from the agent.** The clone uses a URL that contains the token, with git's credential helper switched off (`-c credential.helper=`), because the Box image tells git to save credentials on disk where the agent could read them. Right after the clone, the remote URL is reset to the one without a token. The token only comes back for the push, after the agent has finished.
+- **`runScript` is for everything slow.** `box.exec.command` holds one HTTP request open until the command ends, and the SDK's request timeout is 10 minutes by default. An agent run can take longer, so the script is written to a file and started in the background with `nohup setsid`, and we ask every 10 seconds whether an exit-code file has appeared. The short `sh` helper is kept for quick commands only.
+- **The agent's reply goes to a file.** `claude -p ... > summary.md` puts the final reply in `summary.md`. The same script sends everything else to a log, which is what we show on the issue when something fails. This is also why the script uses `claude -p` without `--bare`: bare mode does not read your Claude token.
+- **We run the checks ourselves.** The prompt tells the agent to run them too, but a pull request is only opened when our own run of `npm run build` passes.
+- **Every way out ends on the issue.** A failure, a question from the agent, or an empty change ends with the label `factory:needs-attention` and a comment that says why, so you never have to dig through the Actions log to find out what happened.
+- **A re-run replaces the old attempt.** The push uses `--force` on the `factory/issue-N` branch, and an open pull request for that branch is updated instead of duplicated.
+
+#### 6.3 Try it from your machine first
+
+The script can run on your machine with the secrets from `.env`, which is much faster to debug than a workflow. First create a small, safe test issue in the **demo app** and add the `ready` label to it, for example:
+
+> **Title:** Change the homepage heading
+> **Description:** On the homepage, replace the default content with a single heading that says "Built by the software factory".
+
+Then run, in Git Bash in the **software-factory** repo:
+
+```bash
+    node --env-file=.env src/run.mjs YOUR-USERNAME/software-factory-demo-app 1
+```
+
+Replace `1` with the number of your issue. It takes a few minutes. Watch the issue in the browser while it runs: `ready` turns into `factory:running`, and then into `factory:review`. The output ends with the address of the pull request.
+
+Open the pull request and read it like any other. It should say `Closes #1`, show a small diff, and start with the agent's own summary. If your demo app deploys previews on Vercel, the preview check should turn green.
+
+If it fails, the issue now carries `factory:needs-attention` and a comment with the log. Read that first. Then:
+
+1. `GitHub ... failed: 403` or `404`: the factory token (Step 4.2) cannot reach the demo app, is missing one of Contents, Pull requests or Issues, or has expired.
+2. `GitHub ... failed: 422` when opening the pull request: usually a branch problem. Delete the `factory/issue-N` branch in the demo app and run again.
+3. The setup command failed: look at the log on the issue. `npm ci` needs a `package-lock.json` in the demo app. Run `npm install` there once and commit the lock file.
+4. The agent stopped with an error: usually the Claude token. Check Step 4.4.
+5. The checks failed: the agent's change does not build. Read the log, improve the issue text, and add the label again.
+6. The preview on the pull request is blocked: the commit author is wrong. Use the noreply address from 6.1.
+
+A run that was killed in the middle leaves a Box called `factory-issue-N-...` behind. Delete it in the Upstash console. Boxes count against your plan.
+
+#### 6.4 Run it from the workflow
+
+When the local run works, make the factory workflow do the same. Replace **all** content of `.github/workflows/factory.yml` in the **software-factory** repo with:
+
+```yaml
+name: Factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: App repo, for example owner/name
+        required: true
+      issue:
+        description: Issue number
+        required: true
+
+permissions:
+  contents: read
+
+run-name: "${{ inputs.repo }} #${{ inputs.issue }}"
+
+# One run per issue at a time. A second run waits, finds that ready is gone, and stops.
+concurrency:
+  group: factory-${{ inputs.repo }}-${{ inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install the factory
+        run: npm ci
+
+      - name: Work on the issue
+        env:
+          FACTORY_REPO: ${{ inputs.repo }}
+          FACTORY_ISSUE: ${{ inputs.issue }}
+          FACTORY_GITHUB_TOKEN: ${{ secrets.FACTORY_GITHUB_TOKEN }}
+          UPSTASH_BOX_API_KEY: ${{ secrets.UPSTASH_BOX_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node src/run.mjs
+```
+
+Then commit everything the workflow needs. The lock file matters, because `npm ci` fails without it:
+
+```bash
+    cd software-factory
+    git add package.json package-lock.json src scripts .github/workflows/factory.yml
+    git commit -m "Let the agent work on an issue"
+    git push
+```
+
+A few things worth knowing:
+
+- The runner gets all three secrets, but only the script uses them. The agent in the Box only ever receives the Claude token, because that is the one thing it needs to run.
+- The `inputs` go through `env` variables and not straight into the script, as in Step 3.4, so text in an input can never be run as a command.
+- The factory repo is private, so the minutes the runner waits for the Box count against your GitHub plan. The runner is held for the whole run.
+
+#### 6.5 Test the whole chain
+
+1. In the demo app, create a new issue, for example "Add a footer to the homepage", with a clear description.
+2. Read the issue text once more. The agent runs with its permission prompts switched off and reads whatever the issue says, so only label issues you trust, and especially so in a public repo.
+3. Add the `ready` label.
+4. Open the **Actions** tab of the `software-factory` repo. One **Factory** run appears, named after your repo and issue number. Open it to follow the log.
+5. After a few minutes, check all of these:
+   - The issue went `ready`, `factory:running`, `factory:review`, with two comments from the factory.
+   - There is a pull request from `factory/issue-N` that says `Closes #N` and holds the agent's summary.
+   - The preview deployment on the pull request is green.
+   - No Box is left behind in the Upstash console.
+6. Review the pull request, and merge it. The issue closes by itself.
+
+If no run appears, go through the checklist at the end of Step 3.5 first. Everything there still applies.
+
+A few things worth knowing:
+
+- Each run creates a new Box, and deletes it at the end. That is simple, and the price is a slower start, because every run installs the dependencies from scratch. Later steps replace this with a pool of ready workers.
+- When the checks fail, the agent gets no second chance yet. Giving it the failure output and one more attempt is a good extension once this works.
+- Parallel runs for different issues of the same app all edit the same few files, so later merges may conflict. That is a property of parallel work, not a bug.
+- When you finish the project, rotate or delete the four secrets from Step 4.
