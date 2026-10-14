@@ -325,9 +325,21 @@ A few things worth knowing:
 - When you finish the project, rotate or delete all four secrets.
 - In the next step we create one sandbox and prove that the agent can sign in and answer.
 
-### Step 5: Smoke-test one sandbox
+### Step 5: Smoke-test one sandbox in Upstash
 
-In this step we build the second hand-off: the **workspace**. We create one Upstash **Box** (a sandbox) from a script on your machine, sign Claude Code in inside it, ask it to reply `BOX OK`, and delete the Box again. No repo is touched and no issue is involved. If this works, the Box key, the Claude CLI and the sign-in token are all proven, and everything later builds on that.
+In this step we build the second hand-off: the **workspace**. We create one Upstash **Box** (a sandbox) from a script on your machine, sign Claude Code in inside it, ask it to reply `BOX OK`, and delete the Box again.
+
+No repo is touched and no issue is involved. If this works, the Box key, the Claude CLI and the sign-in token are all proven, and everything later builds on that.
+
+#### What are we proving
+
+Until now the factory workflow ran on the GitHub Actions runner, which was only a temporary workspace. The real agent will run inside a Box, so before building on it we check the three things it depends on, with a one-line question instead of a real issue:
+
+1. **The Box key.** Can your machine create a Box on your Upstash account?
+2. **Claude Code in the Box.** Is the `claude` CLI there, and does it run?
+3. **The Claude token.** Can Claude Code sign in inside the Box, where nobody can open a browser, and answer?
+
+Finding out now is much cheaper than finding out later, mixed in with GitHub tokens, branches and pull requests. The smoke test is also a small rehearsal of the real job: create a Box, put the token in, run `claude -p`, collect the answer. Only the prompt will differ.
 
 #### 5.1 Set up the project
 
@@ -348,25 +360,27 @@ In the **software-factory** repo, create a `package.json`, install the Box SDK, 
 Create the file `scripts/smoke-test.mjs` in the **software-factory** repo and paste in the following:
 
 ```js
+// The Box SDK, and the folder and file inside the Box where the token will live.
 import { Box } from "@upstash/box"
 
 const HOME = "/workspace/home"
 const ENV_FILE = `${HOME}/.factory/env`
 
+// Stop early if the Claude token is missing, before anything is created.
 const token = process.env.CLAUDE_CODE_OAUTH_TOKEN
 if (!token) {
   console.error("CLAUDE_CODE_OAUTH_TOKEN is not set. Run this with: node --env-file=.env scripts/smoke-test.mjs --yes")
   process.exit(1)
 }
 
+// Preview mode: say what would happen and create nothing until --yes is given.
 console.log("Box to create: factory-smoke-claude (stock Upstash image, Node runtime, browser access on)")
 if (!process.argv.includes("--yes")) {
   console.log("\nPreview only. Add --yes to run the test. It uses one Box slot and a little of your Claude quota.")
   process.exit(0)
 }
 
-// Runs a short shell command in the Box. The Box runs plain `sh`, so we append
-// the exit code to the output to be sure that a failure is never silent.
+// sh is a helper function that runs a shell command in the Box and throws on a non-zero exit code, so a failure is never silent.
 async function sh(box, command, { allowFailure = false } = {}) {
   const run = await box.exec.command(`( ${command} ) 2>&1; echo "__EXIT__$?"`)
   const match = /__EXIT__(\d+)\s*$/.exec(run.result ?? "")
@@ -376,6 +390,7 @@ async function sh(box, command, { allowFailure = false } = {}) {
   return { code, output }
 }
 
+// Create the sandbox. Browser access can only be switched on here, at creation.
 const box = await Box.create({
   name: "factory-smoke-claude",
   labels: ["factory", "smoke-test"],
@@ -384,13 +399,14 @@ const box = await Box.create({
 })
 console.log(`Created Box ${box.id}`)
 
+// Everything below runs inside try, so that finally always cleans up.
 let passed = false
 try {
   // What does a stock Box contain?
   const facts = await sh(box, 'echo "user=$(whoami) arch=$(uname -m)"; for t in node npm git python3 claude; do printf "%s: " $t; ($t --version 2>/dev/null || echo "not installed") | head -n 1; done')
   console.log(facts.output)
 
-  // Browser access can only be switched on when a Box is created.
+  // Check that the Box really has browser access (this throws if it does not).
   await box.browser.listTabs()
   console.log("browser access: yes")
 
@@ -416,6 +432,7 @@ try {
   console.log(`\nDeleted Box ${box.id}.`)
 }
 
+// Report the verdict, and set the exit code so that scripts and CI can tell pass from fail.
 console.log(passed ? "\nPASS: Claude Code answered from inside a Box." : "\nFAIL: see the output above.")
 process.exitCode = passed ? 0 : 1
 ```
