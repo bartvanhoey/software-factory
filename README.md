@@ -1201,4 +1201,469 @@ A few things worth knowing:
 - A run holds a GitHub Actions runner the whole time, including the time it waits for a free worker, up to 30 minutes. In a private repo those minutes count against your plan.
 - Several pull requests in the same small app edit the same few files. Each one is fine alone, and later merges may conflict. That is a property of parallel work, not a bug.
 - The workers are created once and keep running forever. When you finish the project, delete them with `node --env-file=.env scripts/workers.mjs delete --yes`, and rotate or delete the four secrets from Step 4.
-- Every worker starts a job with an empty workspace but with the tools of the stock Box. If your app needs more tools than a stock Box has, those go into a worker image, which is a separate step.
+- Every worker starts a job with an empty workspace but with the tools of the stock Box. If your app needs more tools than a stock Box has, those go into a worker image, which is the next step.
+
+### Step 8: A worker image, and a scale test
+
+This step has two parts. First we give the workers a **worker image**: a Box that is set up once, with everything slow or rarely changing already inside, and saved as a **snapshot**. Every worker is then created from that snapshot, so it starts with the tools it needs. Then we put the whole factory under load: six issues at once, three workers.
+
+#### What is an image, and what goes into it
+
+A snapshot is a copy of the full disk of a Box. Upstash can create any number of new Boxes from one snapshot, and deleting the original Box does not delete its snapshots.
+
+What belongs in the image: things that are slow to install and rarely change. Language toolchains and system packages the app needs, agent skills, MCP servers, a browser tool for an agent that checks its own pages.
+
+What does not belong in the image:
+
+- **App code.** The app changes all the time, and every job makes a fresh clone anyway. A copy in the image is stale at once.
+- **Secrets.** They are hard to rotate once they are baked into a snapshot. The factory writes them at the start of each job and removes them at the end.
+- **Small files you keep editing**, such as house rules for the agent. Every wording change would mean a new image.
+
+For our demo app, the stock Box is honestly already enough: it has Node, npm, git and Claude Code. So the image in this step is small on purpose. It does one useful thing, and shows the mechanism that you would use for anything bigger. It fills the **npm cache** with all the packages of the demo app, so the first `npm ci` in a fresh worker does not have to download them. A pool worker also warms its cache by itself during its first job, so the gain is the first job of every worker that is created new. The real value of this step is the mechanism: once it exists, adding a slow tool later is one more line in `worker/setup.sh`.
+
+One rule about browsers, because your workers were created with browser access in Step 7. **Browser access is decided when a Box is created, and an image passes on the access of the Box it was built in.** `Box.fromSnapshot` does not send the `browser` option at all (we checked the SDK source), so nothing you pass there changes it. An image built in a Box without browser access gives every worker created from it no browser, with no way to add one later. We build in `factory-worker-1`, which has one.
+
+#### 8.1 Write the setup script
+
+Create the file `worker/setup.sh` in the **software-factory** repo. It defines what goes into the image:
+
+```bash
+#!/bin/bash
+# Defines what goes into the worker image. scripts/build-image.mjs runs this
+# inside a worker's Box and then takes a snapshot of the result.
+#
+# Put slow, rarely changing things here. Keep app code and secrets out.
+#
+# Facts about a Box: Debian 12 on ARM64, user "boxuser" with passwordless sudo,
+# Node, git and Claude Code already installed.
+set -euo pipefail
+export PATH=$HOME/.local/bin:$PATH
+
+# The package files of the demo app were put in this folder by the build script.
+# npm ci fills the npm cache (~/.npm) with every package of the app. The build
+# script throws node_modules away afterwards, and the cache stays.
+echo "--- npm cache of the demo app"
+cd /workspace/home/.image-build/app
+npm ci --silent
+
+# More slow tools go here, for example a browser tool, a Python toolchain with
+#   sudo apt-get install -y python3-venv python3-pip
+# or an agent skill.
+
+# The build log is the only evidence of what is in the image, and the build
+# must fail when something is missing. List every tool the workers rely on.
+echo "--- check"
+node --version
+npm --version
+git --version
+claude --version
+```
+
+The script runs with `set -euo pipefail`, so any failing line stops the build and no snapshot is taken.
+
+#### 8.2 Write the build script
+
+Create the file `scripts/build-image.mjs` in the **software-factory** repo and paste in the following. Replace `YOUR-USERNAME`.
+
+```js
+// Builds the worker image: runs worker/setup.sh in one worker's Box, cleans the Box, and takes a snapshot of it.
+// Preview: node --env-file=.env scripts/build-image.mjs <worker name>
+// Build:   node --env-file=.env scripts/build-image.mjs <worker name> --yes
+import { readFileSync } from "node:fs"
+import { Box } from "@upstash/box"
+import { BUSY_LABEL, listWorkers } from "../src/pool.mjs"
+
+// Settings: where the package files of the app come from, and what the image is called.
+const APP_REPO = "YOUR-USERNAME/software-factory-demo-app"
+const BASE_BRANCH = "main"
+const SNAPSHOT_NAME = `factory-worker-${new Date().toISOString().slice(0, 10)}`
+const BUILD_TIMEOUT_MINUTES = 30
+
+// Places in the Box, and text that gives away a secret.
+const HOME = "/workspace/home"
+const BUILD_DIR = `${HOME}/.image-build`
+const SECRET_PATTERNS = ["github_pat_", "ghp_", "gho_", "sk-ant-", '"refresh_token"']
+
+const [workerName] = process.argv.slice(2).filter((arg) => !arg.startsWith("--"))
+const yes = process.argv.includes("--yes")
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const q = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`
+
+// Run a short shell command in the Box, and throw on a non-zero exit code (the helper from Step 5).
+async function sh(box, command, { allowFailure = false } = {}) {
+  const run = await box.exec.command(`( ${command} ) 2>&1; echo "__EXIT__$?"`)
+  const match = /__EXIT__(\d+)\s*$/.exec(run.result ?? "")
+  const code = match ? Number(match[1]) : 1
+  const output = (run.result ?? "").replace(/__EXIT__\d+\s*$/, "").trimEnd()
+  if (code !== 0 && !allowFailure) throw new Error(`Command failed with exit code ${code}:\n${output.slice(-2000)}`)
+  return { code, output }
+}
+
+// Run a longer bash script in the Box in the background and poll until it ends (the helper from Step 6).
+async function runScript(box, name, lines, timeoutMinutes) {
+  const base = `${BUILD_DIR}/${name}`
+  await box.files.write({ path: `${base}.sh`, content: ["#!/bin/bash", `exec > ${base}.log 2>&1`, "set -e", ...lines, ""].join("\n") })
+  await sh(box, `rm -f ${base}.exit && nohup setsid bash -lc ${q(`bash ${base}.sh; echo $? > ${base}.exit`)} > /dev/null 2>&1 & echo started`)
+  const started = Date.now()
+  while (Date.now() - started < timeoutMinutes * 60_000) {
+    await sleep(10_000)
+    const { output } = await sh(box, `cat ${base}.exit 2>/dev/null || echo running`)
+    if (output.trim() !== "running") {
+      const log = (await sh(box, `tail -n 80 ${base}.log`, { allowFailure: true })).output
+      return { passed: output.trim() === "0", log }
+    }
+    console.log(`  ${name} is still running...`)
+  }
+  throw new Error(`"${name}" did not finish within ${timeoutMinutes} minutes.`)
+}
+
+// Read one file of the app from GitHub, with the factory token from Step 4.2. The token stays on this machine.
+async function fetchAppFile(path) {
+  const response = await fetch(`https://api.github.com/repos/${APP_REPO}/contents/${path}?ref=${BASE_BRANCH}`, {
+    headers: { Authorization: `Bearer ${process.env.FACTORY_GITHUB_TOKEN}`, Accept: "application/vnd.github.raw+json", "X-GitHub-Api-Version": "2022-11-28" },
+  })
+  if (!response.ok) throw new Error(`GitHub GET ${path} failed: ${response.status}`)
+  return response.text()
+}
+
+async function main() {
+  // Pick the worker to build in. It must exist, and it must not be working on an issue.
+  const workers = await listWorkers()
+  const worker = workers.find((w) => w.name === workerName)
+  if (!worker) throw new Error(`Usage: build-image.mjs <worker name> [--yes]. Workers: ${workers.map((w) => w.name).join(", ") || "none yet"}`)
+  if (worker.labels?.includes(BUSY_LABEL)) throw new Error(`${worker.name} is busy. Pick a free worker.`)
+
+  // Say what we are about to do, and create nothing until --yes is given.
+  console.log(`Image name:   ${SNAPSHOT_NAME}`)
+  console.log(`Built in:     ${worker.name} (${worker.id})`)
+  console.log(`Setup script: worker/setup.sh, with the package files of ${APP_REPO}`)
+  if (!yes) {
+    console.log("\nPreview only. Add --yes to build. It takes a few minutes.")
+    return
+  }
+
+  // Mark the worker as busy, so that no run starts in it while we build.
+  const box = await Box.get(worker.id, { timeout: 15 * 60 * 1000 })
+  await box.labels.add(BUSY_LABEL)
+  try {
+    if (worker.status === "paused") await box.resume()
+
+    // An image passes on the browser access of the Box it was built in, so check it before we build.
+    await box.browser.listTabs().catch((error) => {
+      if (/not enabled/i.test(error.message)) throw new Error(`${worker.name} has no browser access, and every worker made from the image would have none. Browser access cannot be added to an existing Box. Delete the workers and create them again first.`)
+      throw error
+    })
+
+    // Put the setup script and the package files of the app in the Box, and run the script.
+    await sh(box, `rm -rf ${BUILD_DIR} && mkdir -p ${BUILD_DIR}/app`)
+    await box.files.write({ path: `${BUILD_DIR}/app/package.json`, content: await fetchAppFile("package.json") })
+    await box.files.write({ path: `${BUILD_DIR}/app/package-lock.json`, content: await fetchAppFile("package-lock.json") })
+    await box.files.write({ path: `${BUILD_DIR}/setup.sh`, content: readFileSync(new URL("../worker/setup.sh", import.meta.url), "utf8").replaceAll("\r\n", "\n") })
+    const result = await runScript(box, "build", [`bash ${BUILD_DIR}/setup.sh`], BUILD_TIMEOUT_MINUTES)
+    console.log(result.log)
+    if (!result.passed) throw new Error("worker/setup.sh failed, so no snapshot was taken.")
+
+    // Remove everything that belongs to a job and not to the image: sign-in files, clones, transcripts of old agent runs.
+    await sh(box, `cd ${HOME} && rm -rf .image-build work job .factory .claude/projects ~/.git-credentials ~/.npm/_logs`)
+    console.log("\nRemoved sign-in files, old workspaces and the build folder.")
+
+    // Last line of defence: refuse to snapshot when anything that looks like a secret is still on the disk.
+    const leaks = await sh(box, `grep -rIlE --exclude-dir=node_modules --exclude-dir=_cacache '${SECRET_PATTERNS.join("|")}' /home/boxuser ${HOME} 2>/dev/null | head -n 10`, { allowFailure: true })
+    if (leaks.output.trim()) throw new Error(`These files still hold something that looks like a secret, so no snapshot was taken:\n${leaks.output}`)
+    console.log("Secret scan clean.")
+
+    // Take the snapshot. This waits until it is ready.
+    const snapshot = await box.snapshot({ name: SNAPSHOT_NAME })
+    console.log(`\nSnapshot ${snapshot.name} is ready.\nSnapshot id: ${snapshot.id}\nPaste this id into SNAPSHOT_ID in src/pool.mjs.`)
+  } finally {
+    // Give the worker back.
+    await box.labels.remove(BUSY_LABEL).catch(() => {})
+    await box.pause().catch(() => {})
+    console.log("Worker released and paused.")
+  }
+}
+
+// Do not call process.exit() after fetch: on Windows it can crash Node. Set the exit code instead.
+try {
+  await main()
+} catch (error) {
+  console.error(error.message)
+  process.exitCode = 1
+}
+```
+
+What the script does that is worth understanding:
+
+- **The helpers are copies.** `sh` and `runScript` are the same as in `src/run.mjs`. A bigger project would move them into one shared file. Here, copying keeps every step readable on its own.
+- **The package files come through GitHub, not through a clone.** The script fetches `package.json` and `package-lock.json` from the demo app with the factory token on your machine and writes them into the Box. The token never enters the Box, and no app code ends up in the image.
+- **Clean first, scan second, snapshot last.** A snapshot captures the whole disk, including whatever earlier jobs left behind. So the script removes sign-in files, clones and Claude's transcripts, then searches the disk for text that looks like a token, and takes the snapshot only when nothing was found.
+
+#### 8.3 Use the image in the pool
+
+Two small changes to `src/pool.mjs`, and two to `scripts/workers.mjs`.
+
+**In `src/pool.mjs`**, replace the settings block at the top:
+
+```js
+// Settings: how many workers, and how long a run waits for a free one.
+export const WORKER_COUNT = 2
+export const NAME_PREFIX = "factory-worker-"
+const WAIT_FOR_WORKER_MINUTES = 30
+```
+
+with:
+
+```js
+// Settings: how many workers, how long a run waits for a free one, and the worker image (empty until you have built one).
+export const WORKER_COUNT = 3
+export const NAME_PREFIX = "factory-worker-"
+export const SNAPSHOT_ID = ""
+const WAIT_FOR_WORKER_MINUTES = 30
+```
+
+and replace the `createWorkerBox` function:
+
+```js
+// Create one worker Box. The workers script pauses it right after.
+export const createWorkerBox = (name) => Box.create({ name, labels: [POOL_LABEL], runtime: "node", browser: true, timeout: REQUEST_TIMEOUT_MS })
+```
+
+with:
+
+```js
+// Create one worker Box, from the worker image when there is one. The workers script pauses it right after.
+// Box.fromSnapshot ignores "browser": a Box made from an image has browser access exactly when the Box the image was taken from had it.
+export const createWorkerBox = (name) => {
+  const options = { name, labels: [POOL_LABEL], runtime: "node", timeout: REQUEST_TIMEOUT_MS }
+  return SNAPSHOT_ID ? Box.fromSnapshot(SNAPSHOT_ID, options) : Box.create({ ...options, browser: true })
+}
+```
+
+`WORKER_COUNT` goes up to 3 for the scale test. Check that your Upstash plan has room for three Boxes. You leave `SNAPSHOT_ID` empty until 8.4 has built the image.
+
+**In `scripts/workers.mjs`**, replace the first line that reads the command:
+
+```js
+const [command, argument] = process.argv.slice(2).filter((arg) => !arg.startsWith("--"))
+```
+
+with:
+
+```js
+const [command, argument, shellCommand] = process.argv.slice(2).filter((arg) => !arg.startsWith("--"))
+```
+
+then replace the loop inside the `provision` command:
+
+```js
+      for (const name of missing) {
+        const box = await createWorkerBox(name)
+        await box.pause()
+        console.log(`Created ${name} (${box.id}) and paused it.`)
+      }
+```
+
+with:
+
+```js
+      for (const name of missing) {
+        const box = await createWorkerBox(name)
+        // Browser access cannot be added later, so show it for every new worker.
+        const browser = await box.browser.listTabs().then(() => "yes", () => "no")
+        await box.pause()
+        console.log(`Created ${name} (${box.id}), browser access: ${browser}, and paused it.`)
+      }
+```
+
+and add a new command **above** the `// Delete all workers. This cannot be undone.` comment, to look inside a worker:
+
+```js
+  // Run one command in a free worker, for example to check what its image contains.
+  } else if (command === "exec") {
+    const data = workers.find((w) => w.name === argument)
+    if (!data) throw new Error(`No worker called "${argument}". Run the status command to see the names.`)
+    if (data.labels?.includes(BUSY_LABEL)) throw new Error(`${data.name} is busy. Pick a free worker.`)
+    if (!shellCommand) throw new Error('Usage: workers.mjs exec <worker name> "<command>"')
+    const box = await Box.get(data.id)
+    if (data.status === "paused") await box.resume()
+    console.log((await box.exec.command(shellCommand)).result)
+    await box.pause()
+
+```
+
+#### 8.4 Build the image and recreate the workers
+
+The workers you made in Step 7 do not change when an image appears. A Box that exists stays as it is. So the order is: build the image in one worker, then delete all workers and create them again from the image. Deleting the workers does not delete the snapshot. In Git Bash in the **software-factory** repo:
+
+First look, and build:
+
+```bash
+    node --env-file=.env scripts/workers.mjs status
+    node --env-file=.env scripts/build-image.mjs factory-worker-1
+    node --env-file=.env scripts/build-image.mjs factory-worker-1 --yes
+```
+
+Both workers must be `free`. The preview prints the image name and the worker. The build takes a few minutes. At the end you should see the output of the check section (the versions of node, npm, git and claude), then `Secret scan clean.` and a snapshot id.
+
+Open `src/pool.mjs` and paste the id between the quotes of `SNAPSHOT_ID`. Then delete the old workers, which is permanent, so look first:
+
+```bash
+    node --env-file=.env scripts/workers.mjs delete
+    node --env-file=.env scripts/workers.mjs delete --yes
+    node --env-file=.env scripts/workers.mjs provision --yes
+    node --env-file=.env scripts/workers.mjs status
+```
+
+`provision` now creates `factory-worker-1` to `factory-worker-3` from the image. Look at the `browser access:` part of each line it prints. It must say `yes` for all three. If it says `no`, the image came from a Box without browser access: see the troubleshooting below.
+
+Then check what a worker from the image really contains. The single quotes matter, so that Git Bash does not expand `~` or `$HOME` on your machine:
+
+```bash
+    node --env-file=.env scripts/workers.mjs exec factory-worker-2 'node --version; claude --version; du -sh ~/.npm'
+    node --env-file=.env scripts/workers.mjs exec factory-worker-2 'ls -d ~/.git-credentials /workspace/home/.factory /workspace/home/work 2>&1'
+```
+
+The first command must print the versions and a cache size of a few hundred megabytes or less. The second must answer `No such file or directory` three times: no secrets and no old workspaces in the image.
+
+If something goes wrong:
+
+1. `worker/setup.sh failed`: read the log that the script printed. `npm ci` needs a `package-lock.json` in the demo app, and the factory token needs access to it.
+2. `has no browser access`: your workers were created without it. Set `browser: true` in the `Box.create` call of `createWorkerBox`, delete the workers, create them again with an empty `SNAPSHOT_ID`, and build the image again.
+3. `browser access: no` for workers made from the image: the image was built in a Box without browser access. Same fix as the previous point.
+4. `These files still hold something that looks like a secret`: the script names the files. Delete them in the Box, or add the folder to the clean-up line in the script, and build again. Do not remove the scan.
+5. A Box limit error when creating the workers: your plan is full. Delete leftover Boxes in the Upstash console, or lower `WORKER_COUNT`.
+
+#### 8.5 Prepare the issues for the scale test
+
+Now the load. We create six small issues in the demo app, without labels, so you decide when the factory starts.
+
+Create the file `scripts/demo-issues.json` in the **software-factory** repo. Replace `YOUR-USERNAME` in all six places:
+
+```json
+[
+  {
+    "repo": "YOUR-USERNAME/software-factory-demo-app",
+    "title": "Add a footer to the homepage",
+    "body": "Add a simple footer at the bottom of the homepage with the text \"Built by the software factory\". Follow the existing styling of the app."
+  },
+  {
+    "repo": "YOUR-USERNAME/software-factory-demo-app",
+    "title": "Add an About page",
+    "body": "Add an /about page with a heading \"About\" and a short paragraph of two or three sentences about this demo app. Do not change any other page."
+  },
+  {
+    "repo": "YOUR-USERNAME/software-factory-demo-app",
+    "title": "Add a custom 404 page",
+    "body": "Add a friendly 404 page with the message \"This page does not exist\" and a link back to the homepage."
+  },
+  {
+    "repo": "YOUR-USERNAME/software-factory-demo-app",
+    "title": "Add a health check route",
+    "body": "Add a route at /api/health that returns JSON with {\"status\": \"ok\"} and HTTP status 200."
+  },
+  {
+    "repo": "YOUR-USERNAME/software-factory-demo-app",
+    "title": "Add a Contact page",
+    "body": "Add a /contact page with a heading \"Contact\" and a mailto link with the text \"Send us an email\". Do not change any other page."
+  },
+  {
+    "repo": "YOUR-USERNAME/software-factory-demo-app",
+    "title": "Set the page title and description",
+    "body": "Set the title of the app to \"Software Factory Demo\" and add a one-sentence description, in the metadata of the root layout."
+  }
+]
+```
+
+Create the file `scripts/create-demo-issues.mjs`:
+
+```js
+// Creates the demo issues from scripts/demo-issues.json with the gh CLI.
+// Preview:                node scripts/create-demo-issues.mjs
+// Create, without labels: node scripts/create-demo-issues.mjs --yes
+// Create and start all:   node scripts/create-demo-issues.mjs --yes --ready
+//
+// With --ready the issues get the ready label and the factory starts on all of them at once.
+// gh must then be signed in as someone on the allow-list of the trigger workflow (Step 3.3).
+import { spawnSync } from "node:child_process"
+import { readFileSync } from "node:fs"
+
+const yes = process.argv.includes("--yes")
+const ready = process.argv.includes("--ready")
+const issues = JSON.parse(readFileSync(new URL("./demo-issues.json", import.meta.url), "utf8"))
+
+// One issue per entry. Without --yes we only say what would happen.
+for (const issue of issues) {
+  if (!yes) {
+    console.log(`Would create in ${issue.repo}: ${issue.title}${ready ? " [ready]" : ""}`)
+    continue
+  }
+  const args = ["issue", "create", "--repo", issue.repo, "--title", issue.title, "--body", issue.body]
+  if (ready) args.push("--label", "ready")
+  const result = spawnSync("gh", args, { encoding: "utf8" })
+  if (result.status !== 0) throw new Error(result.stderr.trim())
+  console.log(result.stdout.trim())
+}
+
+if (!yes) console.log(`\nPreview only. ${issues.length} issues would be created. Add --yes to create them.`)
+```
+
+Commit everything, and preview the issues:
+
+```bash
+    git add worker scripts src
+    git commit -m "Add a worker image and the scale test"
+    git push
+    node scripts/create-demo-issues.mjs
+```
+
+#### 8.6 Run the scale test
+
+Before you start, read what will happen. Six issues and three workers means three runs start working and three wait. Every waiting run holds a GitHub Actions runner, up to 30 minutes, and in a private repo those minutes count against your plan. The three working agents share the rate limits of your one Claude subscription. Two of the six issues may touch the same files, so later merges may conflict. That is not a bug, it is what parallel work looks like.
+
+1. Make sure all three workers are free: `node --env-file=.env scripts/workers.mjs status`.
+2. Create the six issues and start them all at once:
+
+```bash
+    node scripts/create-demo-issues.mjs --yes --ready
+```
+
+3. Open the **Actions** tab of the `software-factory` repo. Six **Factory** runs appear, one per issue. Open one of the waiting ones. Its log says `No free worker. Checking again in 30 seconds.` every half minute.
+4. In a second Git Bash window, watch the pool while the runs go:
+
+```bash
+    node --env-file=.env scripts/workers.mjs status
+```
+
+Run it a few times. Three workers show `BUSY (run-...)`. When one finishes it shows `free`, and a few seconds to half a minute later a waiting run has taken it.
+
+5. When all six runs are done, check:
+   - There are six pull requests in the demo app, one per issue, each saying `Closes #N`.
+   - Every issue ended on `factory:review`, or on `factory:needs-attention` with a comment that tells you why.
+   - `status` shows all three workers `paused` and `free`.
+   - No run failed with a rate-limit message. If one did, its issue says so on `factory:needs-attention`: label it again later.
+   - Each pull request has a green Vercel preview.
+   - At most three Boxes exist in the Upstash console, all paused, none left over from this test.
+
+6. Review the pull requests. Merge them one by one, and expect a conflict between the ones that touch the same files. Resolve it, or close the pull request and add the `ready` label to its issue again after the first merge, so the factory builds it on top of the new state.
+
+If something goes wrong:
+
+1. Fewer runs than issues: a trigger did not fire. Go through the checklist at the end of Step 3.5.
+2. A run says `No free worker in time`: all workers were busy for 30 minutes. Look at `status`. A `BUSY` worker without a run is a leftover of a cancelled run: free it with `node --env-file=.env scripts/workers.mjs release factory-worker-1`.
+3. Two issues in one worker: look for `claimed by another run at the same moment` in the logs. If it keeps happening, raise the four-second wait in `claimWorker` in `src/pool.mjs`.
+4. Pull requests that are empty or break the build: read the agent's summary and the checks log on the issue, and improve the issue text.
+
+A few things worth knowing:
+
+- A passing scale test proves the mechanics: the trigger, the claiming, the waiting, the release, and the image. It does not prove that the agent writes good code. You read every pull request.
+- The image is a copy of a moment in time. After you change `worker/setup.sh`, build again, paste the new id, delete the workers and create them again. Old snapshots are not removed automatically. Delete the ones you no longer need in the Upstash console.
+- If you add a browser tool to the image later, check it with the `exec` command, with a real action, and not only with its version: open a page and read its title.
+
+#### 8.7 Hand over and clean up
+
+You have a working software factory. Before you stop:
+
+1. **Rotate or delete every secret you used.** That is the trigger token in the demo app, and the factory token, the Upstash Box key and the Claude token in the factory repo. Any of them that you pasted in a chat or showed on screen is exposed and has to be replaced. Write down when each one expires: the GitHub tokens on the date you chose, the Claude token after a year.
+2. **Know the risk.** The agent runs with its permission prompts switched off, holds its Claude sign-in for the length of a job, and reads whatever the issue says. The allow-list decides who may add the label, not who wrote the issue. So read an issue before you label it, above all in a public repo.
+3. **Know the everyday commands:** `scripts/workers.mjs status` to see who is busy, `release <name>` for a worker that a cancelled run left busy, `build-image.mjs` after a change to `worker/setup.sh`.
+4. **Stop the costs when you are done.** Delete the workers with `node --env-file=.env scripts/workers.mjs delete --yes`, and the snapshot in the Upstash console. Paused Boxes keep their disk and count against your plan.
