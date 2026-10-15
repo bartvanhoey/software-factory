@@ -1,0 +1,32 @@
+[
+  {
+    "repo": "bartvanhoey/software-factory-demo-app",
+    "title": "Add a footer to the homepage",
+    "body": "Add a simple footer at the bottom of the homepage with the text \"Built by the software factory\". Follow the existing styling of the app."
+  },
+  {
+    "repo": "bartvanhoey/software-factory-demo-app",
+    "title": "Add an About page",
+    "body": "Add an /about page with a heading \"About\" and a short paragraph of two or three sentences about this demo app. Do not change any other page."
+  },
+  {
+    "repo": "bartvanhoey/software-factory-demo-app",
+    "title": "Add a custom 404 page",
+    "body": "Add a friendly 404 page with the message \"This page does not exist\" and a link back to the homepage."
+  },
+  {
+    "repo": "bartvanhoey/software-factory-demo-app",
+    "title": "Add a health check route",
+    "body": "Add a route at /api/health that returns JSON with {\"status\": \"ok\"} and HTTP status 200."
+  },
+  {
+    "repo": "bartvanhoey/software-factory-demo-app",
+    "title": "Add a Contact page",
+    "body": "Add a /contact page with a heading \"Contact\" and a mailto link with the text \"Send us an email\". Do not change any other page."
+  },
+  {
+    "repo": "bartvanhoey/software-factory-demo-app",
+    "title": "Set the page title and description",
+    "body": "Set the title of the app to \"Software Factory Demo\" and add a one-sentence description, in the metadata of the root layout."
+  }
+]

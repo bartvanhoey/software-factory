@@ -1240,7 +1240,7 @@ set -euo pipefail
 export PATH=$HOME/.local/bin:$PATH
 
 # The package files of the demo app were put in this folder by the build script.
-# npm ci fills the npm cache (~/.npm) with every package of the app. The build
+# npm ci fills the npm cache (/tmp/.npm-cache) with every package of the app. The build
 # script throws node_modules away afterwards, and the cache stays.
 echo "--- npm cache of the demo app"
 cd /workspace/home/.image-build/app
@@ -1364,11 +1364,11 @@ async function main() {
     if (!result.passed) throw new Error("worker/setup.sh failed, so no snapshot was taken.")
 
     // Remove everything that belongs to a job and not to the image: sign-in files, clones, transcripts of old agent runs.
-    await sh(box, `cd ${HOME} && rm -rf .image-build work job .factory .claude/projects ~/.git-credentials ~/.npm/_logs`)
+    await sh(box, `cd ${HOME} && rm -rf .image-build work job .factory .claude/projects ~/.git-credentials /tmp/.npm-cache/_logs`)
     console.log("\nRemoved sign-in files, old workspaces and the build folder.")
 
     // Last line of defence: refuse to snapshot when anything that looks like a secret is still on the disk.
-    const leaks = await sh(box, `grep -rIlE --exclude-dir=node_modules --exclude-dir=_cacache '${SECRET_PATTERNS.join("|")}' /home/boxuser ${HOME} 2>/dev/null | head -n 10`, { allowFailure: true })
+    const leaks = await sh(box, `grep -rIlE --exclude-dir=node_modules --exclude-dir=_cacache '${SECRET_PATTERNS.join("|")}' /home/boxuser ${HOME} /tmp/.npm-cache 2>/dev/null | head -n 10`, { allowFailure: true })
     if (leaks.output.trim()) throw new Error(`These files still hold something that looks like a secret, so no snapshot was taken:\n${leaks.output}`)
     console.log("Secret scan clean.")
 
@@ -1519,7 +1519,7 @@ Open `src/pool.mjs` and paste the id between the quotes of `SNAPSHOT_ID`. Then d
 Then check what a worker from the image really contains. The single quotes matter, so that Git Bash does not expand `~` or `$HOME` on your machine:
 
 ```bash
-    node --env-file=.env scripts/workers.mjs exec factory-worker-2 'node --version; claude --version; du -sh ~/.npm'
+    node --env-file=.env scripts/workers.mjs exec factory-worker-2 'node --version; claude --version; du -sh /tmp/.npm-cache'
     node --env-file=.env scripts/workers.mjs exec factory-worker-2 'ls -d ~/.git-credentials /workspace/home/.factory /workspace/home/work 2>&1'
 ```
 
